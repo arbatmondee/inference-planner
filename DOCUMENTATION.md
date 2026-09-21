@@ -21,13 +21,17 @@ shorter overview and design principles.
 5. [Understanding the `AnalysisReport`](#understanding-the-analysisreport)
 6. [Confidence levels — how to read estimates](#confidence-levels--how-to-read-estimates)
 7. [Compatibility rules and error codes](#compatibility-rules-and-error-codes)
-8. [Authenticating to Hugging Face Hub](#authenticating-to-hugging-face-hub)
-9. [Inspecting local models](#inspecting-local-models)
-10. [Package architecture](#package-architecture)
-11. [Extending the library](#extending-the-library)
-12. [Testing](#testing)
-13. [Building & distributing](#building--distributing)
-14. [Known limitations](#known-limitations)
+8. [Explicit GPU selection & MIG safety](#explicit-gpu-selection--mig-safety)
+9. [Full-stack validation (Python / PyTorch / CUDA / architecture)](#full-stack-validation-python--pytorch--cuda--architecture)
+10. [Evaluating candidate runtime versions](#evaluating-candidate-runtime-versions)
+11. [Real runtime validation (opt-in probe)](#real-runtime-validation-opt-in-probe)
+12. [Authenticating to Hugging Face Hub](#authenticating-to-hugging-face-hub)
+13. [Inspecting local models](#inspecting-local-models)
+14. [Package architecture](#package-architecture)
+15. [Extending the library](#extending-the-library)
+16. [Testing](#testing)
+17. [Building & distributing](#building--distributing)
+18. [Known limitations](#known-limitations)
 
 ---
 
@@ -120,7 +124,11 @@ inference-planner analyze --model <identifier-or-path> --runtime <name> [options
 | `--model` | yes | A Hugging Face Hub repo id (e.g. `Qwen/Qwen3-8B`) or a local directory containing `config.json`. |
 | `--runtime` | yes | Registered runtime adapter name. Currently: `vllm`. |
 | `--tensor-parallel-size` | no | Force a specific TP degree. If omitted, one is recommended automatically based on model size and available VRAM. |
+| `--device-ids` | no | Comma-separated GPU indices to pin the deployment to (e.g. `0,1`), instead of the planner assuming devices `0..tensor_parallel_size-1`. See [Explicit GPU selection](#explicit-gpu-selection--mig-safety). |
+| `--candidate-versions` | no | Comma-separated runtime version strings to evaluate instead of (or as well as) whatever's installed. See [Evaluating candidate runtime versions](#evaluating-candidate-runtime-versions). |
 | `--hf-token` | no | Hugging Face Hub token for gated/private repos. See [Authenticating](#authenticating-to-hugging-face-hub). |
+| `--probe` | no | Real, opt-in Stage-2 validation — actually loads the model. See [Real runtime validation](#real-runtime-validation-opt-in-probe). |
+| `--probe-timeout` | no | Max seconds to wait for `--probe` (default: 600). |
 | `--json` | no | Print the full `AnalysisReport` as JSON instead of the human-readable summary. |
 
 `-v`/`--verbose` (debug logging to stderr) is a **global** flag and must
@@ -141,6 +149,15 @@ inference-planner analyze --model Qwen/Qwen3-8B --runtime vllm --json | jq .depl
 # Force TP=2, and pass a token for a gated model
 inference-planner analyze --model meta-llama/Llama-3-70B --runtime vllm \
     --tensor-parallel-size 2 --hf-token "$HF_TOKEN"
+
+# Pin to specific GPUs
+inference-planner analyze --model Qwen/Qwen3-8B --runtime vllm --device-ids 2,3
+
+# Check whether a couple of other vLLM versions would also work
+inference-planner analyze --model Qwen/Qwen3-8B --runtime vllm --candidate-versions 0.6.3,0.6.2
+
+# Actually load the model and measure real load time/VRAM (slow, expensive, opt-in)
+inference-planner analyze --model Qwen/Qwen3-8B --runtime vllm --probe --probe-timeout 300
 ```
 
 ---
@@ -154,16 +171,23 @@ from inference_planner import InferencePlanner
 
 planner = InferencePlanner()
 report = planner.analyze(
-    model="Qwen/Qwen3-8B",      # required: HF repo id or local path
-    runtime="vllm",              # required: registered runtime adapter name
-    hardware=None,                # optional: pass a pre-detected HardwareInfo; auto-detects if omitted
-    tensor_parallel_size=None,    # optional: force a TP degree; auto-recommended if omitted
-    hf_token=None,                # optional: Hugging Face token for gated/private models
+    model="Qwen/Qwen3-8B",        # required: HF repo id or local path
+    runtime="vllm",                # required: registered runtime adapter name
+    hardware=None,                  # optional: pass a pre-detected HardwareInfo; auto-detects if omitted
+    tensor_parallel_size=None,      # optional: force a TP degree; auto-recommended if omitted
+    device_ids=None,                # optional: pin to specific GPU indices, e.g. (2, 3)
+    hf_token=None,                  # optional: Hugging Face token for gated/private models
+    run_probe=False,                # optional: actually load the model and measure it (expensive; see below)
+    probe_timeout_seconds=600,      # optional: max seconds to wait for run_probe
 )
 ```
 
 There's also a module-level convenience function if you don't need to reuse
 a planner instance: `inference_planner.analyze(model=..., runtime=...)`.
+
+To evaluate several runtime *versions* at once instead of just whatever's
+installed, use `evaluate_candidates()` — see
+[Evaluating candidate runtime versions](#evaluating-candidate-runtime-versions).
 
 ### Individual pieces, used standalone
 
@@ -243,7 +267,7 @@ single object everything resolves to. It's a frozen dataclass with:
 | `resource_estimate` | `ResourceEstimate` | Memory/concurrency figures — see below. |
 | `deployment_plan` | `dict \| None` | Engine-native launch config, **only present when `compatible=True`**. |
 | `warnings` / `errors` | `tuple[str, ...]` | Flattened string versions of hardware-detection warnings + compatibility issues, for quick logging without walking nested objects. |
-| `runtime_validation` | `RuntimeValidationResult \| None` | Always `None` today — reserved for the future Stage-2 probe. |
+| `runtime_validation` | `RuntimeValidationResult \| None` | `None` unless `run_probe=True` was passed **and** static compatibility passed. See [Real runtime validation](#real-runtime-validation-opt-in-probe). |
 
 It has two convenience methods:
 
@@ -311,13 +335,20 @@ contributing a positive `reason`) or returns a `CompatibilityIssue` with a
 | Code | Severity | Meaning |
 |---|---|---|
 | `RUNTIME_NOT_INSTALLED` | error | The named runtime engine (e.g. `vllm`) isn't importable in this environment. |
+| `ARCHITECTURE_NOT_SUPPORTED_BY_RUNTIME` | error | The installed runtime build's own model registry doesn't recognize this architecture, and the model has no custom modeling code to fall back on. |
+| `INVALID_DEVICE_ID` | error | A `device_ids` entry doesn't match any detected GPU. |
+| `DEVICE_COUNT_TP_MISMATCH` | error | `len(device_ids)` doesn't equal `tensor_parallel_size` when both were given explicitly. |
+| `MIG_TENSOR_PARALLEL_UNSUPPORTED` | error | `tensor_parallel_size > 1` was requested but one of the selected GPUs is an NVIDIA MIG slice, not a full peer-to-peer device. |
+| `UNSUPPORTED_PYTHON_VERSION` | error | The running Python interpreter doesn't satisfy the runtime's declared `Requires-Python`. |
+| `CUDA_VERSION_MISMATCH` | error | The installed PyTorch build was compiled against a newer CUDA version than the GPU driver supports. |
 | `UNSUPPORTED_DTYPE` | error | The model's dtype isn't in the runtime's supported dtype list. |
 | `UNSUPPORTED_QUANTIZATION` | error | The model's quantization method isn't supported by the runtime. |
 | `UNSUPPORTED_PRECISION_FOR_HARDWARE` | error | None of the available GPUs report support for the required precision (derived from GPU compute capability, not GPU name). |
+| `TENSOR_PARALLEL_HEAD_MISMATCH` | error | The chosen `tensor_parallel_size` isn't structurally compatible with the model's attention/KV head counts (including the GQA replication case). |
 | `INSUFFICIENT_VRAM` | error | Estimated required VRAM per GPU exceeds available free VRAM. |
-| `TENSOR_PARALLEL_HEAD_MISMATCH` | error | The chosen `tensor_parallel_size` doesn't evenly divide the model's attention head count — a hard structural constraint of TP attention sharding. |
 | `NO_GPU_DETECTED` | warning | No GPU found; most runtimes need one, but this alone doesn't fail compatibility (some engines/backends can run CPU-only). |
 | `UNKNOWN_ARCHITECTURE` | warning | The model's `config.json` didn't declare an `architectures` field. |
+| `ARCHITECTURE_NOT_IN_REGISTRY_HAS_CUSTOM_CODE` | warning | Not in the runtime's native registry, but the model declares `auto_map` custom modeling code that may still work via a trust-remote-code path. |
 
 ```python
 for error in report.compatibility.errors:
@@ -325,6 +356,181 @@ for error in report.compatibility.errors:
         # e.g. suggest a smaller model, more GPUs, or a quantized checkpoint
         ...
 ```
+
+---
+
+## Explicit GPU selection & MIG safety
+
+By default, the planner picks GPUs for you: it recommends a `tensor_parallel_size`
+and (in the deployment plan) uses the first that-many detected GPU indices.
+Pass `device_ids` to pin the deployment to specific GPUs instead — useful on
+a shared/heterogeneous node, or when other GPUs are already busy:
+
+```python
+report = InferencePlanner().analyze(model="...", runtime="vllm", device_ids=(2, 3))
+```
+
+```bash
+inference-planner analyze --model ... --runtime vllm --device-ids 2,3
+```
+
+Rules that get enforced once you do this:
+
+- **`INVALID_DEVICE_ID`** — every id in `device_ids` must correspond to a
+  GPU the hardware layer actually detected.
+- **`DEVICE_COUNT_TP_MISMATCH`** — if you pass *both* `device_ids` and
+  `tensor_parallel_size` and they disagree in count, that's reported as an
+  error rather than silently resolved one way or the other. If you only
+  pass `device_ids`, `tensor_parallel_size` defaults to `len(device_ids)`.
+- **`MIG_TENSOR_PARALLEL_UNSUPPORTED`** — an NVIDIA MIG-partitioned GPU
+  (`GPUInfo.mig_enabled`) isn't a full peer-to-peer device, so it can't
+  participate in tensor parallelism (`tensor_parallel_size > 1`). Single-slice
+  (`tensor_parallel_size=1`) inference on a MIG slice is unaffected.
+
+MIG mode is detected generically (via `nvidia-smi --query-gpu=mig.mode.current`
+or `pynvml.nvmlDeviceGetMigMode`), not inferred from a GPU name.
+
+---
+
+## Full-stack validation (Python / PyTorch / CUDA / architecture)
+
+Beyond dtype/quantization/VRAM, the compatibility layer checks the rest of
+the stack a model deployment actually depends on — again, entirely by
+introspecting what's installed, never a hardcoded compatibility matrix:
+
+- **Python version** (`UNSUPPORTED_PYTHON_VERSION`): the running
+  interpreter is checked against the runtime package's own declared
+  `Requires-Python` (read from its installed package metadata).
+- **PyTorch/CUDA** (`CUDA_VERSION_MISMATCH`): the installed PyTorch build's
+  compiled-against CUDA version (`torch.version.cuda`) is checked against
+  what the GPU driver actually supports
+  (`HardwareInfo.runtime_stack.cuda_version`) — a build compiled for a newer
+  CUDA than the driver supports will fail at runtime, so this is caught
+  ahead of time.
+- **Model architecture support** (`ARCHITECTURE_NOT_SUPPORTED_BY_RUNTIME` /
+  `ARCHITECTURE_NOT_IN_REGISTRY_HAS_CUSTOM_CODE`): the vLLM adapter
+  introspects the *installed build's own* model registry
+  (`vllm.model_executor.models.registry.ModelRegistry`, with fallbacks for
+  older vLLM internal layouts) rather than assuming any architecture named
+  in `config.json` is servable. A model with custom modeling code
+  (`auto_map` in its config) downgrades this to a warning instead of an
+  error, since a trust-remote-code path may still work.
+
+All of these read as `RuntimeCapabilities` fields
+(`required_python_specifier`, `torch_build_cuda_version`,
+`supported_architectures`) that any adapter can populate — they aren't
+vLLM-specific in the compatibility layer itself.
+
+---
+
+## Evaluating candidate runtime versions
+
+`analyze()` only ever inspects whichever runtime version happens to be
+installed in the current process. `evaluate_candidates()` answers a
+different question: *"would version X also work?"* — for versions that
+aren't installed here at all.
+
+```python
+reports = InferencePlanner().evaluate_candidates(
+    model="Qwen/Qwen3-8B",
+    runtime="vllm",
+    candidate_versions=["0.6.3", "0.6.2", "0.5.4"],
+)
+for report in reports:
+    print(report.runtime.version, report.compatible)
+```
+
+```bash
+inference-planner analyze --model Qwen/Qwen3-8B --runtime vllm \
+    --candidate-versions 0.6.3,0.6.2,0.5.4
+```
+
+**What this can and can't tell you**, honestly: since a candidate version
+generally isn't installed, its code can't be executed or introspected. The
+vLLM adapter can only:
+
+1. Confirm the version **exists** (checked against PyPI's JSON API; this
+   needs network access — a failed/offline lookup is reported as "couldn't
+   verify," never silently treated as "doesn't exist").
+2. Apply a conservative, long-stable **baseline** capability set (basic
+   dtypes, tensor-parallel support) — never version-specific features like
+   quantization methods or the model registry, since those genuinely can't
+   be known without running that version's code.
+
+If you already know a candidate's real capabilities (e.g. from your own
+Docker image's build manifest), supply them directly and skip the guessing:
+
+```python
+from inference_planner.runtimes.base import RuntimeCandidate, RuntimeCapabilities
+
+candidate = RuntimeCandidate(
+    name="vllm", version="0.6.2",
+    capabilities_override=RuntimeCapabilities(
+        supported_dtypes=("bfloat16", "float16", "fp8"),
+        supported_quantization_methods=("awq", "gptq"),
+    ),
+)
+```
+
+(`evaluate_candidates()`'s `candidate_versions` parameter takes plain
+version strings and builds `RuntimeCandidate`s internally; construct your
+own `RuntimeCandidate` objects and call `adapter.identify_candidate()` /
+`adapter.capabilities_for_candidate()` directly if you need
+`capabilities_override`.)
+
+No runtime probe is available for candidates (see next section) — a
+version that isn't installed can't be launched.
+
+---
+
+## Real runtime validation (opt-in probe)
+
+Everything above is **static analysis**: metadata and formulas, never
+actually running the model. `run_probe=True` (or `--probe` on the CLI) is a
+real **Stage-2** check: if, and only if, static compatibility already
+passed, it actually launches vLLM, loads the model, and measures what
+really happens.
+
+```python
+report = InferencePlanner().analyze(
+    model="Qwen/Qwen3-8B", runtime="vllm", run_probe=True, probe_timeout_seconds=300,
+)
+if report.runtime_validation:
+    print(report.runtime_validation.model_load_time_seconds)
+    print(report.runtime_validation.actual_vram_usage_gb)
+```
+
+```bash
+inference-planner analyze --model Qwen/Qwen3-8B --runtime vllm --probe --probe-timeout 300
+```
+
+**This never runs unless you explicitly ask for it.** It's genuinely
+expensive: it downloads/loads real model weights and consumes real GPU
+memory, and can take minutes. It's also skipped automatically if static
+compatibility already failed (loading a model already known to be
+incompatible isn't useful) or if it's not installed.
+
+Safety: the probe runs vLLM in a **subprocess**, never in your own process.
+A CUDA OOM or a crash while loading can't take your calling process down
+with it — you get back a `RuntimeValidationResult` with
+`confidence=UNKNOWN` and a note explaining what went wrong instead.
+
+What it measures vs. doesn't:
+
+| Measures | Doesn't measure |
+|---|---|
+| Model load time | Time-to-first-token (needs the streaming/async API) |
+| Approximate peak VRAM (`torch.cuda.max_memory_allocated`) | Steady-state concurrent throughput |
+| A rough single-request generation rate | Multi-request/batched behavior |
+
+`report.runtime_validation.notes` always explains these limitations
+explicitly — check it before treating the numbers as a full benchmark.
+This is a load-and-smoke-test probe, not a benchmarking harness.
+
+To add probing for another engine, implement
+`inference_planner.validation.base.RuntimeValidator` (see
+`validation/vllm_probe.py` for the reference implementation) and register
+it: `inference_planner.validation.register_validator("sglang", MyValidator())`.
 
 ---
 
@@ -384,7 +590,7 @@ inference_planner/
 │                    exception hierarchy, the generic Registry[T] plugin container,
 │                    dtype->bytes-per-element table
 ├── hardware/        vendor-agnostic hardware discovery
-│   ├── base.py      HardwareInfo/GPUInfo/CPUInfo data model + HardwareProvider protocol
+│   ├── base.py      HardwareInfo/GPUInfo (incl. mig_enabled)/CPUInfo + HardwareProvider protocol
 │   ├── nvidia.py    NVIDIA provider (pynvml, falling back to `nvidia-smi` CLI)
 │   ├── cpu.py       CPU/RAM via psutil
 │   └── detector.py  HardwareDetector: runs every registered provider, merges output
@@ -393,20 +599,26 @@ inference_planner/
 │   ├── huggingface.py  reads config.json/tokenizer_config.json/safetensors index
 │   └── analyzer.py  ModelAnalyzer: dispatches to whichever provider claims an identifier
 ├── runtimes/        inference engine adapters
-│   ├── base.py      RuntimeAdapter protocol + RuntimeCapabilities/RuntimeIdentity
-│   ├── vllm.py       VLLMAdapter: introspects the installed vllm package
+│   ├── base.py      RuntimeAdapter protocol + RuntimeCapabilities/RuntimeIdentity/RuntimeCandidate
+│   ├── vllm.py       VLLMAdapter: introspects the installed vllm package; also resolves
+│   │                 not-installed candidate versions (identify_candidate/capabilities_for_candidate)
 │   └── registry.py  lookup adapters by name ("vllm", ...)
 ├── compatibility/   rule-based compatibility verdicts
-│   ├── rules.py      Rule protocol + DEFAULT_RULES (8 built-in checks)
+│   ├── rules.py      Rule protocol + DEFAULT_RULES (13 built-in checks)
 │   └── analyzer.py  CompatibilityAnalyzer: runs all registered rules, aggregates
 ├── resources/       memory/concurrency estimation formulas (shared by every runtime adapter)
 │   ├── types.py      OverheadProfile, MemoryEstimate, CountEstimate, ResourceEstimate
-│   └── estimator.py ResourceEstimator: the actual math
+│   ├── tensor_parallel.py  shared TP/head-divisibility check (recommender + compatibility rule)
+│   └── estimator.py ResourceEstimator: the actual math, device_ids-aware
 ├── planner/         orchestration
-│   └── planner.py   InferencePlanner: hardware + model + runtime -> AnalysisReport
+│   └── planner.py   InferencePlanner: hardware + model + runtime -> AnalysisReport;
+│                     also evaluate_candidates() for multi-version comparison
 ├── schemas/         the final report shape
 │   └── report.py    AnalysisReport + JSON/human-readable rendering
-├── validation/       Stage-2 (runtime-probe) interfaces — not implemented yet
+├── validation/       Stage-2 runtime-probe: interface + a real, opt-in vLLM implementation
+│   ├── base.py       RuntimeValidator protocol + RuntimeValidationResult
+│   ├── vllm_probe.py VLLMSubprocessValidator: loads the model in a subprocess, measures it
+│   └── registry.py   lookup validators by runtime name
 └── cli.py            argparse-based CLI
 ```
 
@@ -500,7 +712,7 @@ register_rule(MyCustomRule())
 
 ```bash
 pip install -e ".[dev,huggingface]"
-pytest                                        # all 50+ unit tests, no GPU/vLLM required
+pytest                                        # all 100+ unit tests, no GPU/vLLM required
 pytest --cov=inference_planner --cov-report=term-missing
 ```
 
@@ -539,17 +751,33 @@ pip install git+https://your-git-host/inference-planner.git
 
 ## Known limitations
 
-- **Static analysis only.** Everything is derived from metadata (config
-  files, `nvidia-smi`/pynvml readings), never from actually loading or
-  running a model. Real VRAM usage, time-to-first-token, and
-  tokens/sec can differ from the estimates. The `inference_planner.validation`
-  module defines the interface for an eventual "actually start the engine
-  and measure it" stage, but nothing implements it yet.
+- **Static analysis is the default; runtime validation is opt-in and
+  partial.** Without `run_probe=True`, everything is derived from metadata
+  and formulas, never from actually running a model. Even with
+  `run_probe=True`, the vLLM probe measures load time, approximate peak
+  VRAM, and a rough generation rate — it does not measure true
+  time-to-first-token (needs the streaming API) or steady-state concurrent
+  throughput. See [Real runtime validation](#real-runtime-validation-opt-in-probe).
 - **One runtime adapter today**: vLLM. SGLang/TensorRT-LLM/ONNX Runtime
-  adapters don't exist yet, though the interface is designed for them.
+  adapters don't exist yet, though the interface is designed for them —
+  this also means `evaluate_candidates()` and `--probe` only work with
+  `runtime="vllm"` until more adapters/validators are added.
+- **Candidate version evaluation can't execute code it doesn't have.**
+  `evaluate_candidates()` confirms a version *exists* (via PyPI) but can
+  only apply conservative, generic capabilities to it unless you supply
+  `capabilities_override` yourself — see
+  [Evaluating candidate runtime versions](#evaluating-candidate-runtime-versions).
+  It also needs network access for the PyPI lookup; a failed lookup is
+  reported as "couldn't verify," never silently treated as "doesn't exist."
+- **Model-registry introspection (`supported_architectures`) is
+  best-effort.** vLLM has moved this registry across versions; if none of
+  the known locations/attribute names are found, the field comes back
+  empty and `ArchitectureSupportedByRuntimeRule` treats that as "unknown,"
+  not "unsupported."
 - **NVIDIA-only hardware provider today.** AMD/Intel/Apple providers aren't
   implemented; `GPUVendor` already has enum values for them, and adding a
-  provider doesn't require touching any other module.
+  provider doesn't require touching any other module. MIG detection
+  (`GPUInfo.mig_enabled`) is likewise NVIDIA-specific for now.
 - **Parameter-count heuristic overshoots for MoE models.** When a model
   doesn't ship a safetensors weight index, parameter count is estimated
   from a generic dense-transformer formula, which doesn't account for

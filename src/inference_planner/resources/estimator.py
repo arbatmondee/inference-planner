@@ -14,8 +14,9 @@ from __future__ import annotations
 
 from inference_planner.core.dtype import bytes_per_element, bytes_per_element_for_quantization
 from inference_planner.core.enums import Confidence
-from inference_planner.hardware.base import HardwareInfo
+from inference_planner.hardware.base import GPUInfo, HardwareInfo
 from inference_planner.models.base import ModelInfo
+from inference_planner.resources.tensor_parallel import tp_compatible_with_heads
 from inference_planner.resources.types import (
     CountEstimate,
     MemoryEstimate,
@@ -38,13 +39,14 @@ class ResourceEstimator:
         overhead_profile: OverheadProfile,
         *,
         tensor_parallel_size: int | None = None,
+        device_ids: tuple[int, ...] | None = None,
     ) -> ResourceEstimate:
         weight_bytes_per_param = self._weight_bytes_per_param(model)
-        available_vram_gb = self._min_gpu_free_gb(hardware)
+        available_vram_gb = self._min_gpu_free_gb(hardware, device_ids)
 
         if tensor_parallel_size is None:
             tensor_parallel_size = self._recommend_tensor_parallel_size(
-                model, hardware, overhead_profile, weight_bytes_per_param
+                model, hardware, overhead_profile, weight_bytes_per_param, device_ids
             )
 
         weight_memory = self._weight_memory(model, weight_bytes_per_param, tensor_parallel_size)
@@ -198,27 +200,47 @@ class ResourceEstimator:
         hardware: HardwareInfo,
         profile: OverheadProfile,
         bytes_per_param: float | None,
+        device_ids: tuple[int, ...] | None = None,
     ) -> int:
-        gpu_count = hardware.gpu_count
-        if gpu_count <= 1:
-            return max(gpu_count, 1)
+        usable_gpu_count = len(device_ids) if device_ids is not None else hardware.gpu_count
+        if usable_gpu_count <= 1:
+            return max(usable_gpu_count, 1)
+
+        # Only ever recommend a TP degree that could structurally work — searching
+        # divisors of the *selected* GPU count, not the whole node's, and skipping
+        # any degree that can't evenly shard this model's attention heads.
+        candidates = [
+            tp for tp in _divisors_ascending(usable_gpu_count)
+            if tp_compatible_with_heads(model.attention, tp)
+        ]
+        if not candidates:
+            return 1  # no divisor of the selection is structurally valid; don't guess
+
         count = model.parameter_count.count
-        available_gb = self._min_gpu_free_gb(hardware)
-        usable_gb = available_gb * profile.default_gpu_memory_utilization
         if count is None or bytes_per_param is None:
             return 1
-        for tp in _divisors_ascending(gpu_count):
+
+        available_gb = self._min_gpu_free_gb(hardware, device_ids)
+        usable_gb = available_gb * profile.default_gpu_memory_utilization
+        for tp in candidates:
             weight_gb = (count * bytes_per_param) / _BYTES_PER_GB / tp
             overhead_gb = profile.fixed_overhead_gb + profile.per_gpu_fixed_overhead_gb
             overhead_gb += weight_gb * profile.activation_overhead_fraction
             if weight_gb + overhead_gb <= usable_gb:
                 return tp
-        return gpu_count
+        return candidates[-1]  # nothing fits; report the largest structurally-valid degree
 
-    def _min_gpu_free_gb(self, hardware: HardwareInfo) -> float:
-        if not hardware.gpus:
+    def _selected_gpus(self, hardware: HardwareInfo, device_ids: tuple[int, ...] | None) -> list[GPUInfo]:
+        if device_ids is None:
+            return list(hardware.gpus)
+        by_index = {gpu.index: gpu for gpu in hardware.gpus}
+        return [by_index[i] for i in device_ids if i in by_index]
+
+    def _min_gpu_free_gb(self, hardware: HardwareInfo, device_ids: tuple[int, ...] | None = None) -> float:
+        gpus = self._selected_gpus(hardware, device_ids)
+        if not gpus:
             return 0.0
-        free_values = [gpu.memory_free_mb for gpu in hardware.gpus if gpu.memory_free_mb is not None]
+        free_values = [gpu.memory_free_mb for gpu in gpus if gpu.memory_free_mb is not None]
         if not free_values:
             return 0.0
         return min(free_values) / 1024

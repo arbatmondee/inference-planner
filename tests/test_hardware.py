@@ -6,7 +6,11 @@ from unittest.mock import MagicMock, patch
 from inference_planner.core.registry import Registry
 from inference_planner.hardware.base import GPUInfo, GPUVendor, HardwareProvider, RuntimeStackInfo
 from inference_planner.hardware.detector import HardwareDetector
-from inference_planner.hardware.nvidia import NvidiaHardwareProvider, _precisions_for_compute_capability
+from inference_planner.hardware.nvidia import (
+    NvidiaHardwareProvider,
+    _parse_mig_mode,
+    _precisions_for_compute_capability,
+)
 
 
 class _FakeProvider(HardwareProvider):
@@ -109,6 +113,44 @@ def test_nvidia_provider_falls_back_when_compute_cap_query_unsupported():
 
     assert len(gpus) == 1
     assert gpus[0].compute_capability is None
+
+
+def test_smi_parsing_includes_mig_mode():
+    provider = NvidiaHardwareProvider()
+    csv_output = "0, NVIDIA A100, 81920, 81000, 550.54.15, GPU-1234, 8.0, Enabled"
+    fake_result = MagicMock(stdout=csv_output)
+    with patch.object(NvidiaHardwareProvider, "_has_nvidia_smi", return_value=True), \
+         patch("subprocess.run", return_value=fake_result):
+        gpus = provider._detect_via_smi()
+
+    assert gpus[0].mig_enabled is True
+
+
+def test_smi_falls_back_through_multiple_unsupported_fields():
+    """Both compute_cap and mig.mode.current unsupported by an old nvidia-smi build."""
+    provider = NvidiaHardwareProvider()
+    error = subprocess.CalledProcessError(1, "nvidia-smi")
+    minimal_csv = "0, NVIDIA K80, 12288, 12000, 410.00, GPU-old"
+
+    def fake_run(args, **kwargs):
+        if any("compute_cap" in a or "mig.mode.current" in a for a in args):
+            raise error
+        return MagicMock(stdout=minimal_csv)
+
+    with patch.object(NvidiaHardwareProvider, "_has_nvidia_smi", return_value=True), \
+         patch("subprocess.run", side_effect=fake_run):
+        gpus = provider._detect_via_smi()
+
+    assert len(gpus) == 1
+    assert gpus[0].compute_capability is None
+    assert gpus[0].mig_enabled is None
+
+
+def test_parse_mig_mode():
+    assert _parse_mig_mode("Enabled") is True
+    assert _parse_mig_mode("Disabled") is False
+    assert _parse_mig_mode("N/A") is None
+    assert _parse_mig_mode(None) is None
 
 
 def test_precisions_derived_from_compute_capability_not_gpu_name():

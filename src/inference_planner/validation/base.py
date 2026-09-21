@@ -1,11 +1,11 @@
-"""Interfaces for an eventual runtime-validation (probe/benchmark) stage.
+"""Interfaces for the runtime-validation (probe/benchmark) stage.
 
-Nothing in this module runs a model today. It exists so the distinction
-between ``STATIC_ANALYSIS`` and ``RUNTIME_VALIDATION`` — and between
-estimated and *measured* figures — is architected in from the start, per
-the two-stage design: static analysis decides what *should* work; this
-stage would eventually confirm what *actually* works by loading the model
-and measuring it.
+This is what lets the distinction between ``STATIC_ANALYSIS`` and
+``RUNTIME_VALIDATION`` — and between estimated and *measured* figures —
+be architected in cleanly: static analysis decides what *should* work;
+this stage actually confirms what *works*, by loading the model and
+measuring it. See :mod:`inference_planner.validation.vllm_probe` for the
+concrete, opt-in vLLM implementation.
 """
 
 from __future__ import annotations
@@ -39,17 +39,23 @@ class RuntimeValidationResult:
 
 
 class RuntimeValidator(ABC):
-    """Would start a runtime with a generated config and measure its behavior.
+    """Starts a runtime with a generated config and measures its real behavior.
 
-    Not implemented by any adapter yet (see package constraints: no
-    benchmarking in the initial version). Concrete implementations should
-    launch the engine out-of-process, send it representative requests, and
-    tear it down, returning measured values only for what they actually
-    observed.
+    This is real, expensive, and opt-in: it downloads/loads actual model
+    weights, consumes GPU memory, and can take minutes. Implementations
+    should launch the engine out-of-process (never in the caller's own
+    process — a CUDA OOM or crash during a probe must not take the caller
+    down with it), and return measured values only for what they actually
+    observed, leaving the rest ``None``.
     """
 
     @abstractmethod
     def validate(
-        self, model: ModelInfo, hardware: HardwareInfo, config: dict
+        self,
+        model: ModelInfo,
+        hardware: HardwareInfo,
+        config: dict,
+        *,
+        timeout_seconds: int = 600,
     ) -> RuntimeValidationResult:
         raise NotImplementedError

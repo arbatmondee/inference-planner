@@ -44,10 +44,11 @@ Your scheduler decides whether/how to deploy
 - **Estimates are never presented as measurements.** Every numeric result
   carries a `Confidence` (`measured` / `estimated` / `heuristic` / `unknown`)
   and a `basis` explaining how it was derived.
-- **Two stages, clearly separated.** `STATIC_ANALYSIS` only reads metadata.
-  A `RUNTIME_VALIDATION` stage (actually loading the engine and measuring
-  TTFT/throughput/VRAM) is architected via `inference_planner.validation`
-  but not implemented yet.
+- **Two stages, clearly separated.** `STATIC_ANALYSIS` only reads metadata
+  and never runs by default. An opt-in `RUNTIME_VALIDATION` stage
+  (`run_probe=True` / `--probe`) actually loads the model in a subprocess
+  and measures load time/VRAM/a rough generation rate — see
+  [DOCUMENTATION.md](DOCUMENTATION.md#real-runtime-validation-opt-in-probe).
 
 ## Install
 
@@ -125,9 +126,12 @@ else:
 inference-planner hardware
 inference-planner analyze --model Qwen/Qwen3-8B --runtime vllm
 inference-planner analyze --model Qwen/Qwen3-8B --runtime vllm --json
+inference-planner analyze --model Qwen/Qwen3-8B --runtime vllm --device-ids 2,3
+inference-planner analyze --model Qwen/Qwen3-8B --runtime vllm --candidate-versions 0.6.3,0.6.2
+inference-planner analyze --model Qwen/Qwen3-8B --runtime vllm --probe   # expensive, opt-in: actually loads the model
 ```
 
-Exit codes: `0` compatible, `2` incompatible, `1` on error (e.g. model not found).
+Exit codes: `0` compatible, `2` incompatible, `1` on error (e.g. model not found). Full flag reference in [DOCUMENTATION.md](DOCUMENTATION.md#cli-usage).
 
 ## Extending
 
@@ -157,11 +161,13 @@ Discoverable automatically today: GPU name/VRAM/compute-capability/driver
 `config.json`/safetensors index — architecture, layer/head dimensions,
 context length, quantization, and dtype.
 
-Not reliable without actually running the model: real VRAM usage under load,
-time-to-first-token, tokens/sec, true concurrency limits. These belong to the
-future runtime-validation stage (`inference_planner.validation`), and static
-estimates are always confidence-tagged so callers don't mistake one for the
-other.
+Not reliable from static analysis alone: real VRAM usage under load,
+time-to-first-token, tokens/sec, true concurrency limits. An opt-in runtime
+probe (`run_probe=True` / `--probe`) can measure real load time, approximate
+peak VRAM, and a rough generation rate by actually loading the model in a
+subprocess — but it still doesn't measure TTFT or steady-state concurrent
+throughput. Static estimates are always confidence-tagged so callers don't
+mistake one for the other.
 
 ## Testing
 

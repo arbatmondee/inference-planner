@@ -7,5 +7,13 @@ the runtime and measure it" stage, without implementing it yet — see
 """
 
 from inference_planner.validation.base import RuntimeValidationResult, RuntimeValidator
+from inference_planner.validation.registry import get_validator, register_validator
+from inference_planner.validation.vllm_probe import VLLMSubprocessValidator
 
-__all__ = ["RuntimeValidationResult", "RuntimeValidator"]
+__all__ = [
+    "RuntimeValidationResult",
+    "RuntimeValidator",
+    "get_validator",
+    "register_validator",
+    "VLLMSubprocessValidator",
+]

@@ -33,6 +33,7 @@ _SMI_FIELDS = [
     "driver_version",
     "uuid",
     "compute_cap",
+    "mig.mode.current",
 ]
 
 
@@ -121,6 +122,11 @@ class NvidiaHardwareProvider(HardwareProvider):
                     mp_count = pynvml.nvmlDeviceGetNumGpuCores(handle)
                 except Exception:
                     mp_count = None
+                try:
+                    current_mode, _pending_mode = pynvml.nvmlDeviceGetMigMode(handle)
+                    mig_enabled = current_mode == pynvml.NVML_DEVICE_MIG_ENABLE
+                except Exception:
+                    mig_enabled = None  # not supported on this GPU/driver, or not queryable
 
                 gpus.append(
                     GPUInfo(
@@ -133,6 +139,7 @@ class NvidiaHardwareProvider(HardwareProvider):
                         driver_version=driver_version,
                         multi_processor_count=mp_count,
                         uuid=uuid,
+                        mig_enabled=mig_enabled,
                         supported_precisions=_precisions_for_compute_capability(compute_capability),
                     )
                 )
@@ -157,16 +164,20 @@ class NvidiaHardwareProvider(HardwareProvider):
         return result.stdout.strip()
 
     def _detect_via_smi(self) -> list[GPUInfo]:
-        query = ",".join(_SMI_FIELDS)
-        try:
-            output = self._run_smi([f"--query-gpu={query}", "--format=csv,noheader,nounits"])
-        except subprocess.CalledProcessError:
-            # Older nvidia-smi builds don't support "compute_cap"; retry without it.
-            fields = [f for f in _SMI_FIELDS if f != "compute_cap"]
+        # Older nvidia-smi builds don't support newer query fields (compute_cap,
+        # then mig.mode.current); drop them one at a time until a query succeeds.
+        fields = list(_SMI_FIELDS)
+        droppable = ["compute_cap", "mig.mode.current"]
+        while True:
             query = ",".join(fields)
-            output = self._run_smi([f"--query-gpu={query}", "--format=csv,noheader,nounits"])
-            return self._parse_smi_rows(output, fields)
-        return self._parse_smi_rows(output, _SMI_FIELDS)
+            try:
+                output = self._run_smi([f"--query-gpu={query}", "--format=csv,noheader,nounits"])
+                return self._parse_smi_rows(output, fields)
+            except subprocess.CalledProcessError:
+                if not droppable:
+                    raise
+                field_to_drop = droppable.pop(0)
+                fields = [f for f in fields if f != field_to_drop]
 
     def _parse_smi_rows(self, output: str, fields: list[str]) -> list[GPUInfo]:
         gpus: list[GPUInfo] = []
@@ -186,6 +197,7 @@ class NvidiaHardwareProvider(HardwareProvider):
                     compute_capability=compute_cap if compute_cap and compute_cap != "N/A" else None,
                     driver_version=row.get("driver_version"),
                     uuid=row.get("uuid"),
+                    mig_enabled=_parse_mig_mode(row.get("mig.mode.current")),
                     supported_precisions=_precisions_for_compute_capability(compute_cap),
                 )
             )
@@ -215,6 +227,17 @@ class NvidiaHardwareProvider(HardwareProvider):
                 except IndexError:  # pragma: no cover
                     return None
         return None
+
+
+def _parse_mig_mode(value: str | None) -> bool | None:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized == "enabled":
+        return True
+    if normalized == "disabled":
+        return False
+    return None  # "N/A" or unrecognized: MIG-capability undetermined/not applicable
 
 
 def _safe_float(value: str | None) -> float | None:

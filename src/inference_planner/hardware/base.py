@@ -40,6 +40,9 @@ class GPUInfo:
     """Precisions this device is known to support, e.g. ("fp32", "fp16", "bf16")."""
     multi_processor_count: int | None = None
     uuid: str | None = None
+    mig_enabled: bool | None = None
+    """Whether this device is partitioned (e.g. NVIDIA MIG). ``None`` if undetected/inapplicable.
+    A MIG slice is not a full peer-to-peer GPU, which matters for tensor parallelism."""
     extra: dict[str, Any] = field(default_factory=dict)
     """Vendor-specific fields that don't belong in the common schema."""
 

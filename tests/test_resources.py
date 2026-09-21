@@ -99,6 +99,76 @@ def test_weight_memory_unknown_when_param_count_unknown():
     assert estimate.fits_in_available_vram is None
 
 
+def test_tp_recommendation_skips_degrees_that_dont_divide_heads():
+    # 30 attention heads: divisible by 2, not by 4. TP=1 doesn't fit (only
+    # ~90GB/GPU free vs. ~145GB needed), and TP=4 would fit best memory-wise
+    # but can't shard 30 heads evenly -- so TP=2 (which does fit) must win.
+    model = make_model(
+        parameter_count=ParameterCountEstimate(count=70_000_000_000, confidence=Confidence.ESTIMATED),
+        dtype="bfloat16",
+        attention=AttentionConfig(num_attention_heads=30, num_key_value_heads=30, head_dim=128),
+    )
+    hardware = make_hardware(gpu_count=4, gpu_overrides={"memory_free_mb": 90_000})
+
+    estimate = ResourceEstimator().estimate(model, hardware, PROFILE, tensor_parallel_size=None)
+
+    assert estimate.recommended_tensor_parallel_size == 2
+
+
+def test_tp_recommendation_restricted_to_selected_device_count():
+    # 8 GPUs on the node, but only 2 are selected -> must only ever consider
+    # divisors of 2 (1 or 2), never e.g. TP=4 or TP=8.
+    model = make_model(
+        parameter_count=ParameterCountEstimate(count=1_000_000_000, confidence=Confidence.ESTIMATED),
+        dtype="bfloat16",
+    )
+    hardware = make_hardware(gpu_count=8, gpu_overrides={"memory_free_mb": 40_000})
+
+    estimate = ResourceEstimator().estimate(
+        model, hardware, PROFILE, tensor_parallel_size=None, device_ids=(0, 1)
+    )
+
+    assert estimate.recommended_tensor_parallel_size in (1, 2)
+
+
+def test_device_ids_restrict_available_vram_to_selected_gpus():
+    hardware = make_hardware(gpu_count=1)
+    # Build a 3-GPU hardware snapshot with distinct free memory per GPU.
+    from tests.conftest import make_gpu
+    from inference_planner.hardware.base import HardwareInfo
+
+    hardware = HardwareInfo(
+        cpu=hardware.cpu,
+        gpus=(
+            make_gpu(index=0, memory_free_mb=10_000),
+            make_gpu(index=1, memory_free_mb=40_000),
+            make_gpu(index=2, memory_free_mb=80_000),
+        ),
+        runtime_stack=hardware.runtime_stack,
+    )
+    model = make_model()
+
+    estimate_all = ResourceEstimator().estimate(model, hardware, PROFILE, tensor_parallel_size=1)
+    estimate_subset = ResourceEstimator().estimate(
+        model, hardware, PROFILE, tensor_parallel_size=1, device_ids=(1, 2)
+    )
+
+    assert estimate_all.available_vram_gb == 10_000 / 1024   # min across all 3
+    assert estimate_subset.available_vram_gb == 40_000 / 1024  # min across selected {1, 2}
+
+
+def test_device_ids_referencing_nonexistent_gpu_yields_zero_available_vram():
+    model = make_model()
+    hardware = make_hardware(gpu_count=2)  # indices 0, 1
+
+    estimate = ResourceEstimator().estimate(
+        model, hardware, PROFILE, tensor_parallel_size=1, device_ids=(5,)
+    )
+
+    assert estimate.available_vram_gb == 0.0
+    assert estimate.fits_in_available_vram is False
+
+
 def test_no_gpu_means_zero_available_vram():
     model = make_model()
     hardware = make_hardware(gpu_count=0)

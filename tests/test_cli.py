@@ -23,7 +23,7 @@ class _CliFakeAdapter(RuntimeAdapter):
     def overhead_profile(self):
         return OverheadProfile(fixed_overhead_gb=1.0)
 
-    def estimate_resources(self, model, hardware, *, tensor_parallel_size=None):
+    def estimate_resources(self, model, hardware, *, tensor_parallel_size=None, device_ids=None):
         return ResourceEstimate(
             weight_memory=MemoryEstimate(estimated_gb=14.0, confidence=Confidence.ESTIMATED),
             kv_cache_memory_per_1k_tokens=MemoryEstimate(estimated_gb=0.1, confidence=Confidence.ESTIMATED),
@@ -37,7 +37,7 @@ class _CliFakeAdapter(RuntimeAdapter):
             approximate_max_concurrency=CountEstimate(estimated_value=4, confidence=Confidence.HEURISTIC),
         )
 
-    def generate_config(self, model, hardware, *, tensor_parallel_size=None):
+    def generate_config(self, model, hardware, *, tensor_parallel_size=None, device_ids=None):
         return {"runtime": "clitest", "tensor_parallel_size": tensor_parallel_size or 1}
 
 
@@ -116,6 +116,109 @@ def test_analyze_command_forwards_hf_token(tmp_path, monkeypatch):
     cli.main(["analyze", "--model", model_path, "--runtime", "clitest", "--hf-token", "cli-secret"])
 
     assert seen_tokens == ["cli-secret"]
+
+
+def test_analyze_command_forwards_device_ids(tmp_path, monkeypatch):
+    model_path = _write_local_model(tmp_path)
+    monkeypatch.setattr(
+        "inference_planner.planner.planner.detect_hardware",
+        lambda: make_hardware(gpu_count=4),
+    )
+    seen = []
+    original_analyze = InferencePlanner.analyze
+
+    def spy_analyze(self, **kwargs):
+        seen.append(kwargs.get("device_ids"))
+        return original_analyze(self, **kwargs)
+
+    monkeypatch.setattr(InferencePlanner, "analyze", spy_analyze)
+
+    cli.main(["analyze", "--model", model_path, "--runtime", "clitest", "--device-ids", "0,1"])
+
+    assert seen == [(0, 1)]
+
+
+def test_analyze_command_rejects_malformed_device_ids(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["analyze", "--model", "x", "--runtime", "clitest", "--device-ids", "not,numbers"])
+
+
+def test_analyze_command_probe_flag_forwards_to_planner(tmp_path, monkeypatch):
+    model_path = _write_local_model(tmp_path)
+    monkeypatch.setattr(
+        "inference_planner.planner.planner.detect_hardware",
+        lambda: make_hardware(gpu_count=1),
+    )
+    seen = []
+    original_analyze = InferencePlanner.analyze
+
+    def spy_analyze(self, **kwargs):
+        seen.append((kwargs.get("run_probe"), kwargs.get("probe_timeout_seconds")))
+        return original_analyze(self, **kwargs)
+
+    monkeypatch.setattr(InferencePlanner, "analyze", spy_analyze)
+
+    cli.main(["analyze", "--model", model_path, "--runtime", "clitest", "--probe", "--probe-timeout", "30"])
+
+    assert seen == [(True, 30)]
+
+
+def test_analyze_command_probe_not_forwarded_by_default(tmp_path, monkeypatch):
+    model_path = _write_local_model(tmp_path)
+    monkeypatch.setattr(
+        "inference_planner.planner.planner.detect_hardware",
+        lambda: make_hardware(gpu_count=1),
+    )
+    seen = []
+    original_analyze = InferencePlanner.analyze
+
+    def spy_analyze(self, **kwargs):
+        seen.append(kwargs.get("run_probe"))
+        return original_analyze(self, **kwargs)
+
+    monkeypatch.setattr(InferencePlanner, "analyze", spy_analyze)
+
+    cli.main(["analyze", "--model", model_path, "--runtime", "clitest"])
+
+    assert seen == [False]
+
+
+def test_candidate_versions_flag_prints_summary_per_candidate(tmp_path, monkeypatch, capsys):
+    model_path = _write_local_model(tmp_path)
+    monkeypatch.setattr(
+        "inference_planner.planner.planner.detect_hardware",
+        lambda: make_hardware(gpu_count=1),
+    )
+
+    exit_code = cli.main([
+        "analyze", "--model", model_path, "--runtime", "clitest",
+        "--candidate-versions", "1.0.0,2.0.0",
+    ])
+
+    out = capsys.readouterr().out
+    assert "Candidate evaluation for runtime 'clitest'" in out
+    assert "1.0.0" in out
+    assert "2.0.0" in out
+    # _CliFakeAdapter doesn't implement identify_candidate, so both degrade
+    # to "not installed" -- and thus incompatible -- without crashing.
+    assert exit_code == 2
+
+
+def test_candidate_versions_json_output_is_a_list(tmp_path, monkeypatch, capsys):
+    model_path = _write_local_model(tmp_path)
+    monkeypatch.setattr(
+        "inference_planner.planner.planner.detect_hardware",
+        lambda: make_hardware(gpu_count=1),
+    )
+
+    cli.main([
+        "analyze", "--model", model_path, "--runtime", "clitest",
+        "--candidate-versions", "1.0.0,2.0.0", "--json",
+    ])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert isinstance(payload, list)
+    assert len(payload) == 2
 
 
 def test_analyze_command_reports_errors_cleanly(capsys):
