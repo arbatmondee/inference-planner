@@ -56,6 +56,52 @@ pip install -e ".[dev,huggingface]"
 # add [nvidia] for pynvml-based GPU detection, [vllm] to actually run vLLM
 ```
 
+## Installing the CLI on another machine
+
+You don't need to clone the repo just to use the CLI. Pick whichever fits:
+
+**With `pip`, straight from GitHub:**
+
+```bash
+pip install "inference-planner[huggingface,nvidia] @ git+https://github.com/arbatmondee/inference-planner.git"
+```
+
+**With `uv` (installs it as an isolated CLI tool on your PATH — recommended):**
+
+```bash
+uv tool install "inference-planner[huggingface,nvidia] @ git+https://github.com/arbatmondee/inference-planner.git"
+uv tool update-shell   # first time only, if `inference-planner` isn't found after install
+```
+
+**From a copied wheel file** (no network access needed on the target machine):
+
+```bash
+python -m build   # run once, on a machine with the source, to produce dist/*.whl
+# copy dist/inference_planner-0.1.0-py3-none-any.whl to the target machine, then:
+pip install "inference_planner-0.1.0-py3-none-any.whl[huggingface,nvidia]"
+# or with uv:
+uv tool install "./inference_planner-0.1.0-py3-none-any.whl[huggingface,nvidia]"
+```
+
+**Editing the source on the target machine instead of just using the CLI:**
+
+```bash
+git clone https://github.com/arbatmondee/inference-planner.git
+cd inference-planner
+pip install -e ".[dev,huggingface]"     # or: uv pip install -e ".[dev,huggingface]"
+```
+
+Verify any of the above with:
+
+```bash
+inference-planner hardware
+```
+
+If the GitHub repo is private, the target machine needs access to clone/fetch
+it (an SSH key with repo access, or an HTTPS URL with a token embedded:
+`git+https://<token>@github.com/arbatmondee/inference-planner.git`) — except
+for the wheel-file option, which needs no repo access at all.
+
 ## Usage
 
 ```python
